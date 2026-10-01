@@ -1,0 +1,109 @@
+# Pull-request validation (runbook section 7.1).
+#
+# Each PR gets an isolated, disposable Lakebase branch (ci-pr-<n>) cut from production and
+# selecting app_dev_db. Migrations are applied there, the preview app is deployed to an isolated
+# bundle namespace, tests run against that branch, and everything is torn down when the PR closes.
+# The branch is a validation resource — it is never promoted.
+#
+# Prerequisites: pin every action to an approved commit; configure GitHub OIDC -> the dev
+# service principal; set repo/environment vars (DATABRICKS_HOST, DATABRICKS_CLIENT_ID,
+# LAKEBASE_PROJECT). Auth is workload identity federation — no stored Databricks token.
+name: Pull request validation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-validation-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  PR_NUMBER: ${{ github.event.pull_request.number }}
+  PR_BRANCH: ci-pr-${{ github.event.pull_request.number }}
+  LAKEBASE_PROJECT: ${{ vars.LAKEBASE_PROJECT }}
+  LAKEBASE_DATABASE: app_dev_db
+  LAKEBASE_CONNECTION_REF: lakebase/dev/ci-pr-${{ github.event.pull_request.number }}/app_dev_db
+  DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+  DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_CLIENT_ID }}
+  BUNDLE_VAR_workspace_host: ${{ vars.DATABRICKS_HOST }}
+  BUNDLE_VAR_pr_id: ${{ github.event.pull_request.number }}
+
+jobs:
+  validate:
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@<approved-pinned-commit>
+      - uses: databricks/setup-cli@<approved-pinned-commit>
+      - run: pip install -r app/src/requirements.txt pytest
+
+      - name: Static migration checks
+        run: ./ci/check_migrations.sh db/migrations
+
+      - name: Quiesce any existing preview before reset
+        run: ./ci/deploy_preview.sh quiesce --pr-id "$PR_NUMBER" --include-background-jobs
+
+      - name: Prepare DEV/PR Lakebase branch (child of production, selects app_dev_db)
+        run: ./ci/lakebase.sh prepare-ci-branch "$LAKEBASE_PROJECT" "$PR_BRANCH" --source-branch production --database "$LAKEBASE_DATABASE" --reset-existing
+
+      - name: Wait for branch and export connection
+        run: ./ci/lakebase.sh wait-and-export "$LAKEBASE_PROJECT" "$PR_BRANCH" "$LAKEBASE_DATABASE" >> "$GITHUB_ENV"
+
+      - name: Publish runtime connection reference
+        run: ./ci/lakebase.sh publish-connection-ref "$PR_BRANCH" "$LAKEBASE_DATABASE" "$LAKEBASE_CONNECTION_REF" >> "$GITHUB_ENV"
+
+      - name: Validate preview bundle
+        run: databricks bundle validate --target dev-preview --var="pr_id=${PR_NUMBER}" --var="lakebase_branch=${PR_BRANCH}" --var="lakebase_database=app_dev_db" --var="lakebase_connection_ref=${LAKEBASE_CONNECTION_REF}"
+
+      - name: Apply migrations to the PR branch
+        env:
+          DATABASE_URL: ${{ env.LAKEBASE_DATABASE_URL }}
+          MIGRATION_GIT_SHA: ${{ github.sha }}
+        run: ./ci/migrate.sh --directory db/migrations
+
+      - name: Deploy isolated preview bundle
+        run: databricks bundle deploy --target dev-preview --var="pr_id=${PR_NUMBER}" --var="lakebase_branch=${PR_BRANCH}" --var="lakebase_database=app_dev_db" --var="lakebase_connection_ref=${LAKEBASE_CONNECTION_REF}"
+
+      - name: Discover preview URL
+        run: ./ci/deploy_preview.sh discover-url --environment dev-preview --pr-id "$PR_NUMBER" >> "$GITHUB_ENV"
+
+      - name: Run tests against the paired preview
+        env:
+          DATABASE_URL: ${{ env.LAKEBASE_DATABASE_URL }}
+          APP_BASE_URL: ${{ env.PREVIEW_APP_URL }}
+        run: |
+          pytest tests/unit app/tests
+          pytest tests/integration
+          ./ci/smoke_test.sh
+
+      - name: Publish schema diff
+        if: always()
+        run: ./ci/lakebase.sh schema-diff "$LAKEBASE_PROJECT" "$PR_BRANCH" "$LAKEBASE_DATABASE" || true
+
+  cleanup:
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@<approved-pinned-commit>
+      - uses: databricks/setup-cli@<approved-pinned-commit>
+      - name: Destroy isolated preview bundle
+        if: always()
+        run: ./ci/deploy_preview.sh destroy --environment dev-preview --pr-id "$PR_NUMBER"
+      - name: Delete preview UC schema
+        if: always()
+        run: ./ci/uc.sh delete-schema --catalog app_dev --schema "pr_${PR_NUMBER}"
+      - name: Delete runtime connection reference
+        if: always()
+        run: ./ci/lakebase.sh delete-connection-ref "$LAKEBASE_CONNECTION_REF"
+      - name: Delete CI branch
+        if: always()
+        run: ./ci/lakebase.sh delete-ci-branch "$PR_BRANCH" "$LAKEBASE_PROJECT"

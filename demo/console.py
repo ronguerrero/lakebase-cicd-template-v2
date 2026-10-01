@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""Guided Lakebase CI/CD console — single long-lived branch, databases per environment.
+
+Walks the developer lifecycle for the revised runbook: ONE workspace, ONE Lakebase project, ONE
+long-lived branch `production` that hosts three databases (app_dev_db / app_qa_db / app_prod_db).
+There is no long-lived dev or qa branch. A change is promoted by REPLAYING the same migrations
+into production/app_dev_db (the DEV baseline), then production/app_qa_db, then production/app_prod_db
+after approval — same branch, different database selector each time.
+
+For each stage it SHOWS the exact command and the underlying Lakebase API call, runs it live, and
+updates the branch tree and the three per-database panels so the audience watches the change roll
+dev -> qa -> prod across the databases on one branch.
+
+Run:  python demo/console.py        (serves http://127.0.0.1:8052)
+"""
+import os
+import subprocess
+import sys
+import threading
+import time
+
+import dash
+from dash import Input, Output, dcc, html
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CI = os.path.join(REPO, "ci")
+sys.path.insert(0, CI)
+import lakebase_api as lb  # noqa: E402
+
+# ----------------------------------------------------------------------------- config
+PROFILE = os.environ.get("DEMO_PROFILE", "lakebase-dev")   # your single-workspace CLI profile
+PROJECT = os.environ.get("DEMO_PROJECT", "lakebase-app")
+BRANCH = "production"                                       # the only long-lived branch
+DEV_DB, QA_DB, PROD_DB = "app_dev_db", "app_qa_db", "app_prod_db"
+DEV_BRANCH = "dev-demo-signup-source"                      # ephemeral child, selects app_dev_db
+PROD_PREFLIGHT = "prod-preflight-demo"                     # ephemeral child, selects app_prod_db
+GIT_SHA = "demo-" + time.strftime("%Y%m%d")
+
+MIG = os.path.join(CI, "migrate.py")
+SEED = os.path.join(CI, "seed.py")
+LKB = os.path.join(CI, "lakebase.sh")
+
+# Run every subprocess with THIS interpreter (the venv that has the SDK/psycopg), and prepend its
+# bin dir to PATH so the `python3` inside ci/*.sh resolves to the venv too — not system python.
+PYBIN = sys.executable
+VENV_BIN = os.path.dirname(PYBIN)
+
+C = {"ink": "#0f2a3f", "mut": "#5a6b7c", "line": "#d7dde5", "bg": "#f5f7fa",
+     "card": "#ffffff", "accent": "#1a56db", "accent2": "#e8f0fe",
+     "ok": "#1e7a46", "run": "#b4690e", "err": "#b42318", "code": "#0b1f33"}
+
+
+def _mig(branch, db, to=""):
+    a = [PYBIN, MIG, "--profile", PROFILE, "--project", PROJECT, "--branch", branch, "--database", db]
+    return a + (["--to", to] if to else [])
+
+
+def _seed(branch, db):
+    return [PYBIN, SEED, "--profile", PROFILE, "--project", PROJECT, "--branch", branch, "--database", db]
+
+
+# stage: id, title, _, blurb, [(display_cmd, argv_or_None)...], api_note
+STAGES = [
+    ("setup", "0 · Platform setup + baseline", "",
+     "One project, one long-lived branch `production` holding all three databases. Seed each of "
+     "app_dev_db / app_qa_db / app_prod_db to the V003 baseline. V004 is the pending change this "
+     "demo promotes across the three databases.",
+     [("./ci/lakebase.sh init lakebase-app", ["bash", LKB, "init", PROJECT]),
+      ("./ci/migrate.sh --branch production --database app_dev_db  --to V003", _mig(BRANCH, DEV_DB, "V003")),
+      ("./ci/seed.py    --branch production --database app_dev_db", _seed(BRANCH, DEV_DB)),
+      ("./ci/migrate.sh --branch production --database app_qa_db   --to V003", _mig(BRANCH, QA_DB, "V003")),
+      ("./ci/seed.py    --branch production --database app_qa_db", _seed(BRANCH, QA_DB)),
+      ("./ci/migrate.sh --branch production --database app_prod_db --to V003", _mig(BRANCH, PROD_DB, "V003")),
+      ("./ci/seed.py    --branch production --database app_prod_db", _seed(BRANCH, PROD_DB))],
+     "postgres.create_project · create_branch(production, no_expiry) · CREATE DATABASE x3"),
+
+    ("feature", "1 · Start the change", "",
+     "A Git feature branch for the code, plus a copy-on-write Lakebase branch cut from `production` "
+     "that SELECTS app_dev_db. The child contains all three databases but the workflow uses only "
+     "app_dev_db — it is a validation host, never promoted.",
+     [("git switch -c feature/APP-204-signup-source", None),
+      ("./ci/lakebase.sh prepare-ci-branch lakebase-app dev-demo-signup-source --source-branch production --database app_dev_db --reset-existing",
+       ["bash", LKB, "prepare-ci-branch", PROJECT, DEV_BRANCH, "--source-branch", BRANCH,
+        "--database", DEV_DB, "--reset-existing"])],
+     "postgres.create_branch(spec.source_branch=projects/lakebase-app/branches/production) — copy-on-write"),
+
+    ("migrate-branch", "2 · Apply the migration on the branch", "",
+     "Apply the ordered migrations to the child's app_dev_db. V001–V003 are already present; only "
+     "V004 is pending. The runner records version, checksum, git SHA, and refuses edits to an "
+     "already-applied migration.",
+     [("./ci/check_migrations.sh db/migrations",
+       ["bash", os.path.join(CI, "check_migrations.sh"), os.path.join(REPO, "db", "migrations")]),
+      ("./ci/migrate.sh --branch dev-demo-signup-source --database app_dev_db", _mig(DEV_BRANCH, DEV_DB))],
+     "psycopg → pg_advisory_xact_lock → apply V004 → INSERT app.schema_migrations"),
+
+    ("test-branch", "3 · Validate on the branch", "",
+     "Unit tests (offline) and a validate pass against the child's app_dev_db confirm the migration "
+     "applied and nothing is pending. In CI, integration + smoke tests and a cross-database denial "
+     "check run here against the isolated branch.",
+     [("pytest tests/unit app/tests", [PYBIN, "-m", "pytest", "-q",
+                                        os.path.join(REPO, "tests", "unit"), os.path.join(REPO, "app", "tests")]),
+      ("./ci/migrate.sh --branch dev-demo-signup-source --database app_dev_db --validate",
+       _mig(DEV_BRANCH, DEV_DB) + ["--validate"])],
+     "pytest · schema-diff · migrate --validate · permission-tests (deny app_dev_runtime→app_qa_db/app_prod_db)"),
+
+    ("build", "4 · Merge → build once", "",
+     "On merge to main the app is built exactly once and published with a SHA-256 digest. Every "
+     "later database gets these same bytes, verified by digest — never a rebuild.",
+     [("./ci/build.sh demo-sha", ["bash", os.path.join(CI, "build.sh"), GIT_SHA]),
+      ("./ci/publish_artifact.sh --sha demo-sha",
+       ["bash", os.path.join(CI, "publish_artifact.sh"), "--sha", GIT_SHA, "--output", "/dev/stdout"])],
+     "deterministic tar + sha256 → immutable artifact URI"),
+
+    ("dev-baseline", "5 · DEV baseline (NEW)", "",
+     "Post-merge, replay the migration set into production/app_dev_db — the shared DEV baseline that "
+     "every future feature branch is cut from. This is the new first promotion stop in the revised "
+     "runbook; it keeps the DEV database current ahead of the team.",
+     [("./ci/migrate.sh --branch production --database app_dev_db", _mig(BRANCH, DEV_DB))],
+     "replay migrations into production/app_dev_db (dev-baseline CI job, sp-app-dev-cicd)"),
+
+    ("deploy-qa", "6 · Deploy to QA", "",
+     "Replay the SAME migration set into production/app_qa_db, then deploy the built artifact. Same "
+     "branch as DEV — only the database selector changes. Promotion is a replay, not a branch copy.",
+     [("./ci/migrate.sh --branch production --database app_qa_db", _mig(BRANCH, QA_DB)),
+      ("databricks bundle deploy --target qa --var=lakebase_branch=production --var=lakebase_database=app_qa_db", None)],
+     "replay migrations into production/app_qa_db → bundle deploy --target qa (same artifact)"),
+
+    ("prod-preflight", "7 · Production preflight", "",
+     "Rehearse on a disposable child of `production` that SELECTS app_prod_db — proving the migration "
+     "against production-shaped data without touching it — then destroy the rehearsal branch.",
+     [("./ci/lakebase.sh create-preflight prod-preflight-demo lakebase-app --source-branch production",
+       ["bash", LKB, "create-preflight", PROD_PREFLIGHT, PROJECT, "--source-branch", BRANCH]),
+      ("./ci/migrate.sh --branch prod-preflight-demo --database app_prod_db", _mig(PROD_PREFLIGHT, PROD_DB)),
+      ("./ci/lakebase.sh delete-ci-branch prod-preflight-demo lakebase-app",
+       ["bash", LKB, "delete-ci-branch", PROD_PREFLIGHT, PROJECT])],
+     "create_branch off production (selects app_prod_db) → rehearse → delete_branch"),
+
+    ("deploy-prod", "8 · 🔒 Approve → deploy to PROD", "",
+     "After the required approval, replay the SAME migration set into production/app_prod_db and "
+     "deploy the SAME verified artifact. Only this step touches the production database.",
+     [("./ci/migrate.sh --branch production --database app_prod_db", _mig(BRANCH, PROD_DB)),
+      ("databricks bundle deploy --target prod --var=lakebase_branch=production --var=lakebase_database=app_prod_db", None),
+      ("git tag -a release-demo-sha", None)],
+     "replay migrations into production/app_prod_db → bundle deploy --target prod → tag release"),
+
+    ("cleanup", "9 · Clean up", "",
+     "Delete the ephemeral feature branch. Idempotent — a scheduled job sweeps any orphans by TTL. "
+     "The stable `production` branch and its three databases remain.",
+     [("./ci/lakebase.sh delete-ci-branch dev-demo-signup-source lakebase-app",
+       ["bash", LKB, "delete-ci-branch", DEV_BRANCH, PROJECT])],
+     "delete_branch (idempotent)"),
+]
+STAGE_IDS = [s[0] for s in STAGES]
+
+LOCK = threading.Lock()
+STATE = {"status": {sid: "pending" for sid in STAGE_IDS}, "log": [], "busy": False,
+         "tree": [], "env": {}}
+
+
+def log(line):
+    with LOCK:
+        STATE["log"].append(line)
+        STATE["log"] = STATE["log"][-400:]
+
+
+def run_stage(sid):
+    with LOCK:
+        if STATE["busy"]:
+            return
+        STATE["busy"] = True
+        STATE["status"][sid] = "running"
+    stage = next(s for s in STAGES if s[0] == sid)
+    log(f"\n━━━ {stage[1]} ━━━")
+    ok = True
+    try:
+        env = dict(os.environ, DATABRICKS_CONFIG_PROFILE=PROFILE, MIGRATION_GIT_SHA=GIT_SHA,
+                   PATH=VENV_BIN + os.pathsep + os.environ.get("PATH", ""))
+        for disp, argv in stage[4]:
+            log(f"$ {disp}")
+            if argv is None:
+                log("  (shown — runs in the real pipeline, not from this console)")
+                continue
+            p = subprocess.Popen(argv, cwd=REPO, env=env, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True, bufsize=1)
+            for ln in p.stdout:
+                log(ln.rstrip())
+            if p.wait() != 0:
+                ok = False
+                log(f"  ✗ exited {p.returncode}")
+                break
+    except Exception as e:  # noqa: BLE001
+        ok = False
+        log(f"  ✗ {e}")
+    with LOCK:
+        STATE["status"][sid] = "done" if ok else "error"
+        STATE["busy"] = False
+    refresh_state()
+
+
+def do_reset():
+    with LOCK:
+        if STATE["busy"]:
+            return
+        STATE["busy"] = True
+    log("\n━━━ Reset demo (rewind V004 on all three databases, delete ephemeral branches) ━━━")
+    try:
+        w = lb.client(PROFILE)
+        for br in (DEV_BRANCH, PROD_PREFLIGHT):
+            lb.delete_branch(w, PROJECT, br)
+            log(f"  - deleted {br}")
+        rb = open(os.path.join(REPO, "db", "rollback", "V004__add_signup_source.sql")).read()
+        for db in (DEV_DB, QA_DB, PROD_DB):
+            conn = lb.connect(w, PROJECT, BRANCH, db)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(rb)
+                    cur.execute("DELETE FROM app.schema_migrations WHERE version='V004'")
+                conn.commit()
+                log(f"  ↩ rewound V004 on production/{db}")
+            finally:
+                conn.close()
+    except Exception as e:  # noqa: BLE001
+        log(f"  ✗ {e}")
+    with LOCK:
+        STATE["status"] = {sid: "pending" for sid in STAGE_IDS}
+        STATE["busy"] = False
+    refresh_state()
+
+
+def refresh_state():
+    """Pull the live branch tree + per-database schema version on production (off the UI thread)."""
+    def worker():
+        try:
+            w = lb.client(PROFILE)
+            tree = lb.list_branches(w, PROJECT)
+        except Exception as e:  # noqa: BLE001
+            with LOCK:
+                STATE["tree"] = [{"branch": f"(cannot reach {PROFILE}: {str(e)[:50]})",
+                                  "source": None, "state": None}]
+            return
+        env = {}
+        for label, db in (("dev", DEV_DB), ("qa", QA_DB), ("prod", PROD_DB)):
+            try:
+                conn = lb.connect(w, PROJECT, BRANCH, db)
+                with conn.cursor() as cur:
+                    cur.execute("SELECT coalesce(max(version),'(none)') FROM app.schema_migrations")
+                    ver = cur.fetchone()[0]
+                    cur.execute("SELECT 1 FROM information_schema.columns WHERE table_schema='app' "
+                                "AND table_name='users' AND column_name='signup_source'")
+                    src = "present" if cur.fetchone() else "absent"
+                    cur.execute("SELECT count(*) FROM app.users")
+                    n = cur.fetchone()[0]
+                conn.close()
+                env[label] = {"db": db, "version": ver, "signup_source": src, "users": n}
+            except Exception as e:  # noqa: BLE001
+                env[label] = {"db": db, "version": "?", "signup_source": str(e)[:30], "users": "?"}
+        with LOCK:
+            STATE["tree"] = tree
+            STATE["env"] = env
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# ----------------------------------------------------------------------------- UI
+app = dash.Dash(__name__, title="Lakebase CI/CD Console")
+PANEL = {"background": C["card"], "border": f"1px solid {C['line']}", "borderRadius": "10px", "padding": "16px"}
+
+
+def pending_change():
+    sql = open(os.path.join(REPO, "db", "migrations", "V004__add_signup_source.sql")).read()
+    return html.Div(style=PANEL, children=[
+        html.Div("THE PENDING CHANGE", style={"fontSize": "11px", "letterSpacing": ".08em",
+                 "color": C["mut"], "fontWeight": 700}),
+        html.Div("db/migrations/V004__add_signup_source.sql", style={"fontWeight": 600, "margin": "4px 0 8px"}),
+        html.Pre(sql, style={"background": C["code"], "color": "#d7e7ff", "padding": "12px",
+                 "borderRadius": "8px", "fontSize": "12px", "overflowX": "auto", "maxHeight": "240px", "margin": 0})])
+
+
+BADGE = {"pending": ("○", C["mut"]), "running": ("●", C["run"]), "done": ("✓", C["ok"]), "error": ("✗", C["err"])}
+
+
+def stage_card(stage):
+    sid, title, _, blurb, cmds, api = stage
+    return html.Div(style={**PANEL, "marginBottom": "10px", "borderLeft": f"4px solid {C['line']}"}, children=[
+        html.Div(style={"display": "flex", "justifyContent": "space-between", "alignItems": "center"}, children=[
+            html.Div([html.Span("○", id={"type": "badge", "sid": sid},
+                                 style={"color": C["mut"], "fontWeight": 700, "marginRight": "8px"}),
+                      html.Span(title, style={"fontWeight": 700})]),
+            html.Button("Run", id={"type": "run", "sid": sid}, n_clicks=0,
+                        style={"padding": "6px 16px", "borderRadius": "7px", "border": "none",
+                               "background": C["accent"], "color": "#fff", "cursor": "pointer", "fontWeight": 600})]),
+        html.Div(blurb, style={"color": C["mut"], "fontSize": "13px", "marginTop": "6px"}),
+        html.Pre("\n".join("$ " + d for d, _ in cmds),
+                 style={"background": C["code"], "color": "#d7e7ff", "padding": "10px", "borderRadius": "6px",
+                        "fontSize": "12px", "overflowX": "auto", "margin": "8px 0"}),
+        html.Div([html.Span("API ", style={"fontWeight": 700, "fontSize": "11px", "color": C["mut"]}),
+                  html.Code(api, style={"fontSize": "12px"})])])
+
+
+app.layout = html.Div(style={"fontFamily": "system-ui,sans-serif", "background": C["bg"],
+                             "color": C["ink"], "minHeight": "100vh", "padding": "20px"}, children=[
+    dcc.Interval(id="tick", interval=1400, n_intervals=0),
+    html.Div(style={"display": "flex", "alignItems": "baseline", "gap": "12px", "marginBottom": "4px"}, children=[
+        html.H1("Lakebase CI/CD — Developer Lifecycle", style={"margin": 0, "fontSize": "22px"}),
+        html.Span(f"one workspace · one branch `production` · 3 databases · project {PROJECT} · profile {PROFILE}",
+                  style={"color": C["mut"], "fontSize": "13px"})]),
+    html.Div("One long-lived branch holds app_dev_db / app_qa_db / app_prod_db · a change is promoted by "
+             "replaying migrations dev → qa → prod across the databases · only code, artifacts, and migrations move forward",
+             style={"color": C["mut"], "fontSize": "13px", "marginBottom": "16px"}),
+
+    html.Div(style={"display": "grid", "gridTemplateColumns": "1.3fr 1fr", "gap": "16px"}, children=[
+        html.Div(children=[
+            html.Div(style={"display": "flex", "gap": "8px", "marginBottom": "12px"}, children=[
+                html.Button("↻ Refresh live state", id="btn-refresh", n_clicks=0,
+                            style={"padding": "8px 12px", "borderRadius": "8px", "border": f"1px solid {C['line']}",
+                                   "background": C["card"], "cursor": "pointer"}),
+                html.Button("⟲ Reset demo", id="btn-reset", n_clicks=0,
+                            style={"padding": "8px 12px", "borderRadius": "8px", "border": f"1px solid {C['line']}",
+                                   "background": C["card"], "cursor": "pointer"})]),
+            html.Div(id="action-sink", style={"display": "none"}),
+            html.Div([stage_card(s) for s in STAGES])]),
+        html.Div(children=[
+            html.Div(id="tree", style={**PANEL, "marginBottom": "16px"}),
+            html.Div(id="envs", style={**PANEL, "marginBottom": "16px"}),
+            pending_change(),
+            html.Div(style={**PANEL, "marginTop": "16px"}, children=[
+                html.Div("ACTIVITY LOG", style={"fontSize": "11px", "letterSpacing": ".08em",
+                         "color": C["mut"], "fontWeight": 700, "marginBottom": "6px"}),
+                html.Pre(id="log", style={"background": C["code"], "color": "#cfe3ff", "padding": "12px",
+                         "borderRadius": "8px", "fontSize": "12px", "height": "220px", "overflowY": "auto", "margin": 0})])])])])
+
+
+@app.callback(Output({"type": "badge", "sid": dash.ALL}, "children"),
+              Output({"type": "badge", "sid": dash.ALL}, "style"),
+              Input("tick", "n_intervals"))
+def render_badges(_):
+    with LOCK:
+        st = dict(STATE["status"])
+    glyphs, styles = [], []
+    for sid in STAGE_IDS:
+        g, col = BADGE[st[sid]]
+        glyphs.append(g)
+        styles.append({"color": col, "fontWeight": 700, "marginRight": "8px"})
+    return glyphs, styles
+
+
+@app.callback(Output("tree", "children"), Output("envs", "children"), Output("log", "children"),
+              Input("tick", "n_intervals"))
+def render_right(_):
+    with LOCK:
+        tree, env, logs = list(STATE["tree"]), dict(STATE["env"]), "\n".join(STATE["log"])
+
+    def row(r):
+        b = r["branch"]
+        tag, col = "", C["mut"]
+        if b == "production":
+            tag, col = "long-lived → app_dev_db + app_qa_db + app_prod_db", C["ink"]
+        elif b.startswith(("ci-pr-", "dev-")):
+            tag, col = "ephemeral child → selects app_dev_db", C["accent"]
+        elif "qa-preflight" in b:
+            tag, col = "ephemeral rehearsal → app_qa_db", C["run"]
+        elif "prod-preflight" in b:
+            tag, col = "ephemeral rehearsal → app_prod_db", C["run"]
+        return html.Div(style={"display": "flex", "justifyContent": "space-between", "padding": "4px 0",
+                               "borderBottom": f"1px solid {C['line']}"},
+                        children=[html.Span(b, style={"fontWeight": 600, "color": col}),
+                                  html.Span(tag, style={"fontSize": "12px", "color": C["mut"]})])
+
+    tree_el = [html.Div("LAKEBASE BRANCH TREE", style={"fontSize": "11px", "letterSpacing": ".08em",
+               "color": C["mut"], "fontWeight": 700, "marginBottom": "6px"})] + \
+        ([row(r) for r in tree] if tree else [html.Div("(click ↻ Refresh live state)", style={"color": C["mut"]})])
+
+    def envcard(name):
+        e = env.get(name, {})
+        hs = e.get("signup_source", "?")
+        hcol = C["ok"] if hs == "present" else C["mut"]
+        return html.Div(style={"padding": "6px 0", "borderBottom": f"1px solid {C['line']}"}, children=[
+            html.Div(f"{name.upper()} — production / {e.get('db','?')}", style={"fontWeight": 600}),
+            html.Div([html.Span(f"schema {e.get('version','?')}  ·  users {e.get('users','?')}  ·  "),
+                      html.Span(f"signup_source {hs}", style={"color": hcol, "fontWeight": 600})],
+                     style={"fontSize": "12px", "color": C["mut"]})])
+
+    env_el = [html.Div("DATABASES ON production (live)", style={"fontSize": "11px", "letterSpacing": ".08em",
+              "color": C["mut"], "fontWeight": 700, "marginBottom": "6px"}),
+              envcard("dev"), envcard("qa"), envcard("prod")]
+    return tree_el, env_el, logs or "(idle)"
+
+
+@app.callback(Output("action-sink", "children"),
+              Input({"type": "run", "sid": dash.ALL}, "n_clicks"),
+              Input("btn-reset", "n_clicks"), Input("btn-refresh", "n_clicks"),
+              prevent_initial_call=True)
+def on_action(run_clicks, reset_clicks, refresh_clicks):
+    trig = dash.callback_context.triggered_id
+    if trig == "btn-refresh":
+        refresh_state()
+    elif trig == "btn-reset":
+        threading.Thread(target=do_reset, daemon=True).start()
+    elif isinstance(trig, dict) and trig.get("type") == "run":
+        threading.Thread(target=run_stage, args=(trig["sid"],), daemon=True).start()
+    return ""
+
+
+if __name__ == "__main__":
+    refresh_state()
+    app.run(debug=False, port=int(os.environ.get("DEMO_PORT", "8052")))

@@ -1,0 +1,108 @@
+# Promote to production (runbook section 7.3).
+#
+# Dispatched with a QA-validated commit SHA. First a disposable prod-preflight-<sha> branch is cut
+# from production, the migrations are rehearsed on it with app_prod_db, and it is destroyed. Then,
+# after a required approval on the `prod` environment, the SAME migrations are replayed against the
+# production branch / app_prod_db and the SAME verified artifact is deployed. Preflight and deploy
+# use different service principals.
+name: Promote to production
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Git SHA already validated in QA
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: write
+
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    environment: prod-preflight          # sp-app-prod-preflight-cicd; cannot write the production branch
+    env:
+      COMMIT_SHA: ${{ inputs.commit_sha }}
+      PREVIEW_BRANCH: prod-preflight-${{ inputs.commit_sha }}
+      LAKEBASE_PROJECT: ${{ vars.LAKEBASE_PROJECT }}
+      LAKEBASE_CONNECTION_REF: lakebase/prod/prod-preflight-${{ inputs.commit_sha }}/app_prod_db
+      DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_CLIENT_ID }}
+      BUNDLE_VAR_workspace_host: ${{ vars.DATABRICKS_HOST }}
+    steps:
+      - uses: actions/checkout@<approved-pinned-commit>
+        with:
+          ref: ${{ inputs.commit_sha }}
+      - uses: databricks/setup-cli@<approved-pinned-commit>
+      - run: pip install -r app/src/requirements.txt
+      - name: Verify QA approval manifest exists for this SHA
+        run: test -f "qa-approvals/${COMMIT_SHA}.json"
+      - name: Create PROD preflight branch from production
+        run: ./ci/lakebase.sh create-preflight "$PREVIEW_BRANCH" "$LAKEBASE_PROJECT" --source-branch production --ttl 14400
+      - name: Wait and export preflight connection
+        run: ./ci/lakebase.sh wait-and-export "$LAKEBASE_PROJECT" "$PREVIEW_BRANCH" app_prod_db >> "$GITHUB_ENV"
+      - name: Rehearse migrations on the preflight branch
+        env:
+          DATABASE_URL: ${{ env.LAKEBASE_DATABASE_URL }}
+          MIGRATION_GIT_SHA: ${{ env.COMMIT_SHA }}
+        run: ./ci/migrate.sh --directory db/migrations
+      - name: Preflight smoke test
+        env:
+          DATABASE_URL: ${{ env.LAKEBASE_DATABASE_URL }}
+        run: ./ci/smoke_test.sh
+      - name: Destroy preflight branch
+        if: always()
+        run: ./ci/lakebase.sh delete-ci-branch "$PREVIEW_BRANCH" "$LAKEBASE_PROJECT"
+
+  deploy:
+    needs: preflight
+    runs-on: ubuntu-latest
+    environment: prod                    # sp-app-prod-cicd; protected by required approval
+    env:
+      COMMIT_SHA: ${{ inputs.commit_sha }}
+      LAKEBASE_PROJECT: ${{ vars.LAKEBASE_PROJECT }}
+      LAKEBASE_CONNECTION_REF: lakebase/prod/production/app_prod_db
+      DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_CLIENT_ID }}
+      BUNDLE_VAR_workspace_host: ${{ vars.DATABRICKS_HOST }}
+      BUNDLE_VAR_prod_service_principal: ${{ vars.PROD_SERVICE_PRINCIPAL }}
+    steps:
+      - uses: actions/checkout@<approved-pinned-commit>
+        with:
+          ref: ${{ inputs.commit_sha }}
+      - uses: databricks/setup-cli@<approved-pinned-commit>
+      - run: pip install -r app/src/requirements.txt
+      - name: Resolve + verify the QA-approved artifact
+        run: |
+          test -f "qa-approvals/${COMMIT_SHA}.json"
+          ARTIFACT_URI=$(python3 -c "import json;print(json.load(open('qa-approvals/${COMMIT_SHA}.json'))['artifact_uri'])")
+          ARTIFACT_SHA256=$(python3 -c "import json;print(json.load(open('qa-approvals/${COMMIT_SHA}.json'))['artifact_sha256'])")
+          echo "ARTIFACT_URI=$ARTIFACT_URI" >> "$GITHUB_ENV"
+          echo "ARTIFACT_SHA256=$ARTIFACT_SHA256" >> "$GITHUB_ENV"
+      - run: ./ci/fetch_artifact.sh --uri "$ARTIFACT_URI" --sha256 "$ARTIFACT_SHA256"
+      - name: Validate PROD bundle before database changes
+        run: databricks bundle validate --target prod --var="lakebase_branch=production" --var="lakebase_database=app_prod_db" --var="lakebase_connection_ref=${LAKEBASE_CONNECTION_REF}" --var="artifact_uri=${ARTIFACT_URI}"
+      - name: Export stable production connection
+        run: ./ci/lakebase.sh export-stable-connection "$LAKEBASE_PROJECT" production app_prod_db >> "$GITHUB_ENV"
+      - name: Replay migrations against production / app_prod_db
+        env:
+          DATABASE_URL: ${{ env.LAKEBASE_STABLE_DATABASE_URL }}
+          MIGRATION_GIT_SHA: ${{ env.COMMIT_SHA }}
+          ARTIFACT_SHA256: ${{ env.ARTIFACT_SHA256 }}
+        run: ./ci/migrate.sh --directory db/migrations
+      - name: Deploy the same artifact to PROD
+        run: databricks bundle deploy --target prod --var="lakebase_branch=production" --var="lakebase_database=app_prod_db" --var="lakebase_connection_ref=${LAKEBASE_CONNECTION_REF}" --var="artifact_uri=${ARTIFACT_URI}"
+      - name: Health check
+        env:
+          DATABASE_URL: ${{ env.LAKEBASE_STABLE_DATABASE_URL }}
+        run: ./ci/smoke_test.sh
+      - name: Tag the release
+        run: |
+          git tag -a "release-${COMMIT_SHA}" "$COMMIT_SHA" -m "Production release ${COMMIT_SHA}"
+          git push origin "release-${COMMIT_SHA}"

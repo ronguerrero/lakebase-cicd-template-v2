@@ -1,0 +1,32 @@
+# Illustrative application job. The pipeline does NOT run migrations from a job — migrations run
+# from the CI runner against the selected branch's DATABASE_URL (see ci/migrate.sh). This job
+# stands in for ordinary application workloads the bundle deploys alongside the app, scoped to the
+# target's namespace and bound to the same Lakebase branch/database the app uses.
+resources:
+  jobs:
+    nightly_rollup:
+      name: lakebase-app-${var.environment}-nightly-rollup
+      tags:
+        environment: ${var.environment}
+      trigger:
+        pause_status: PAUSED        # previews/preflights stay paused; enable only on stable targets
+        periodic:
+          interval: 1
+          unit: DAYS
+      tasks:
+        - task_key: rollup
+          environment_key: default
+          spark_python_task:
+            python_file: ../app/src/jobs/rollup.py
+            parameters:
+              - "--connection-ref"
+              - ${var.lakebase_connection_ref}
+              - "--database"
+              - ${var.lakebase_database}
+      environments:
+        - environment_key: default
+          spec:
+            client: "2"
+            dependencies:
+              - psycopg[binary]
+              - databricks-sdk

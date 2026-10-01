@@ -1,0 +1,17 @@
+# Databricks Apps runtime config for the sample app.
+#
+# The app binds to one Lakebase branch + database via these env vars. The defaults below are the
+# QA binding (production branch, app_qa_db); the CI deploy step overrides LAKEBASE_BRANCH /
+# LAKEBASE_DATABASE / APP_ENVIRONMENT per target (dev-preview → ci-pr-* / app_dev_db,
+# qa → production / app_qa_db, prod → production / app_prod_db).
+# The app resolves the actual credential at runtime (workload identity) — never stored here.
+command: ["python", "app.py"]
+env:
+  - name: LAKEBASE_PROJECT
+    value: "lakebase-app"
+  - name: LAKEBASE_BRANCH
+    value: "production"
+  - name: LAKEBASE_DATABASE
+    value: "app_qa_db"
+  - name: APP_ENVIRONMENT
+    value: "qa"

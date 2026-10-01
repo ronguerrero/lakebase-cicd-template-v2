@@ -1,0 +1,11 @@
+# The sample application, deployed as a Databricks App. One definition; the target supplies the
+# namespace via the resource name (pr_id for previews) so concurrent previews never collide. The
+# app's own runtime env (which branch/database it binds to) lives in app/src/app.yaml; the deploy
+# step passes per-target overrides. The app resolves its database credential at runtime from the
+# non-secret connection reference, so no credential is ever placed in bundle config.
+resources:
+  apps:
+    sample_app:
+      name: lakebase-app-${var.environment}
+      description: "Sample Lakebase user-directory app (${var.environment})"
+      source_code_path: ../app/src

@@ -1,0 +1,115 @@
+# Merge to main: build once, maintain the DEV baseline, then deploy to QA (runbook section 7.2).
+#
+# After merge the app is built EXACTLY ONCE from the main SHA and published with a SHA-256 digest.
+# Then migrations are replayed, on the single long-lived `production` branch, into each database in
+# order: first app_dev_db (the DEV baseline job — keeps the shared DEV database current), then
+# app_qa_db (QA). Promotion is a migration replay against a database selector — never a branch merge
+# or copy. An optional QA preflight rehearses on a disposable child of production first.
+name: Main to QA
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: qa-deployment
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.meta.outputs.sha }}
+      artifact_uri: ${{ steps.publish.outputs.artifact_uri }}
+      artifact_sha256: ${{ steps.publish.outputs.artifact_sha256 }}
+    steps:
+      - uses: actions/checkout@<approved-pinned-commit>
+      - id: meta
+        run: echo "sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+      - run: ./ci/build.sh "$GITHUB_SHA"
+      - run: pip install -r app/src/requirements.txt pytest && pytest tests/unit app/tests
+      - id: publish
+        run: ./ci/publish_artifact.sh --sha "$GITHUB_SHA" --output "$GITHUB_OUTPUT"
+
+  # NEW: keep the shared DEV baseline (production/app_dev_db) current ahead of feature branches.
+  dev-baseline:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: dev
+    env:
+      COMMIT_SHA: ${{ needs.build.outputs.sha }}
+      LAKEBASE_PROJECT: ${{ vars.LAKEBASE_PROJECT }}
+      DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_CLIENT_ID }}
+    steps:
+      - uses: actions/checkout@<approved-pinned-commit>
+        with:
+          ref: ${{ env.COMMIT_SHA }}
+      - uses: databricks/setup-cli@<approved-pinned-commit>
+      - run: pip install -r app/src/requirements.txt
+      - name: Export stable DEV connection (production / app_dev_db)
+        run: ./ci/lakebase.sh export-stable-connection "$LAKEBASE_PROJECT" production app_dev_db >> "$GITHUB_ENV"
+      - name: Replay migrations into the DEV baseline
+        env:
+          DATABASE_URL: ${{ env.LAKEBASE_STABLE_DATABASE_URL }}
+          MIGRATION_GIT_SHA: ${{ env.COMMIT_SHA }}
+          ARTIFACT_SHA256: ${{ needs.build.outputs.artifact_sha256 }}
+        run: ./ci/migrate.sh --directory db/migrations
+
+  deploy-qa:
+    needs: [build, dev-baseline]
+    runs-on: ubuntu-latest
+    environment: qa
+    env:
+      COMMIT_SHA: ${{ needs.build.outputs.sha }}
+      ARTIFACT_URI: ${{ needs.build.outputs.artifact_uri }}
+      ARTIFACT_SHA256: ${{ needs.build.outputs.artifact_sha256 }}
+      LAKEBASE_PROJECT: ${{ vars.LAKEBASE_PROJECT }}
+      LAKEBASE_CONNECTION_REF: lakebase/qa/production/app_qa_db
+      DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_CLIENT_ID }}
+      BUNDLE_VAR_workspace_host: ${{ vars.DATABRICKS_HOST }}
+      BUNDLE_VAR_artifact_uri: ${{ needs.build.outputs.artifact_uri }}
+      BUNDLE_VAR_qa_service_principal: ${{ vars.QA_SERVICE_PRINCIPAL }}
+    steps:
+      - uses: actions/checkout@<approved-pinned-commit>
+        with:
+          ref: ${{ env.COMMIT_SHA }}
+      - uses: databricks/setup-cli@<approved-pinned-commit>
+      - run: pip install -r app/src/requirements.txt pytest
+      - run: ./ci/fetch_artifact.sh --uri "$ARTIFACT_URI" --sha256 "$ARTIFACT_SHA256"
+
+      - name: Validate QA bundle before database changes
+        run: databricks bundle validate --target qa --var="lakebase_branch=production" --var="lakebase_database=app_qa_db" --var="lakebase_connection_ref=${LAKEBASE_CONNECTION_REF}" --var="artifact_uri=${ARTIFACT_URI}"
+
+      - name: Export stable QA connection (production / app_qa_db)
+        run: ./ci/lakebase.sh export-stable-connection "$LAKEBASE_PROJECT" production app_qa_db >> "$GITHUB_ENV"
+
+      - name: Replay migrations into production / app_qa_db
+        env:
+          DATABASE_URL: ${{ env.LAKEBASE_STABLE_DATABASE_URL }}
+          MIGRATION_GIT_SHA: ${{ env.COMMIT_SHA }}
+          ARTIFACT_SHA256: ${{ env.ARTIFACT_SHA256 }}
+        run: ./ci/migrate.sh --directory db/migrations
+
+      - name: Deploy the built artifact to QA
+        run: databricks bundle deploy --target qa --var="lakebase_branch=production" --var="lakebase_database=app_qa_db" --var="lakebase_connection_ref=${LAKEBASE_CONNECTION_REF}" --var="artifact_uri=${ARTIFACT_URI}"
+
+      - name: Stable QA tests
+        env:
+          DATABASE_URL: ${{ env.LAKEBASE_STABLE_DATABASE_URL }}
+        run: |
+          pytest tests/integration
+          ./ci/smoke_test.sh
+
+      - name: Write and publish QA approval manifest
+        run: |
+          mkdir -p qa-approvals
+          cat > "qa-approvals/${COMMIT_SHA}.json" <<JSON
+          {"git_sha":"${COMMIT_SHA}","artifact_uri":"${ARTIFACT_URI}","artifact_sha256":"${ARTIFACT_SHA256}","checks":["integration","smoke"]}
+          JSON
+          echo "published qa-approvals/${COMMIT_SHA}.json"

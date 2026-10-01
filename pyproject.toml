@@ -1,0 +1,17 @@
+[project]
+name = "lakebase-cicd-template"
+version = "0.1.0"
+description = "Reference template: Git + Lakebase branching and CI/CD for a single Databricks workspace"
+requires-python = ">=3.10"
+dependencies = [
+    "psycopg[binary]>=3.1",
+    "databricks-sdk>=0.118.0",
+]
+
+[project.optional-dependencies]
+app = ["flask>=3.0"]
+demo = ["dash>=2.17", "plotly>=5.22"]
+test = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "app/tests"]

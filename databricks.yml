@@ -1,0 +1,126 @@
+# Declarative Automation Bundle (formerly Databricks Asset Bundle) for the sample Lakebase app.
+#
+# One bundle, five targets — the single-workspace model from the runbook (section 8). Every
+# target makes the full deployment tuple explicit: workspace host + Lakebase branch + database +
+# UC catalog/schema + run identity + bundle root (namespace) + connection reference. The SAME
+# workspace host is used everywhere; the branch, database, catalog, identity, and approval gate
+# are what differ. Only migrations and the immutable artifact move forward between targets.
+bundle:
+  name: lakebase-app
+
+include:
+  - resources/*.yml
+
+variables:
+  environment:
+    description: Deployment environment name
+  workspace_host:
+    description: Shared workspace host (one workspace for DEV/QA/PROD)
+    # Supplied via BUNDLE_VAR_workspace_host or --var (e.g. BUNDLE_VAR_workspace_host=https://<your-workspace>).
+  uc_catalog:
+    description: Deployment UC catalog (lakehouse objects only; parallel to Lakebase)
+  uc_schema:
+    description: Deployment UC schema
+    default: app
+  lakebase_branch:
+    description: Deployment Lakebase branch
+    default: production
+  lakebase_database:
+    description: Deployment Lakebase database
+  lakebase_connection_ref:
+    description: Runtime connection reference (non-secret logical id the app resolves at runtime)
+  artifact_uri:
+    description: Immutable application artifact URI
+    default: ""        # release workflows reject this empty default before migrations run
+  pr_id:
+    description: Pull request identifier for preview namespaces
+    default: ""
+  commit_sha:
+    description: Immutable Git commit used for a preflight deployment
+    default: ""
+  qa_service_principal:
+    description: QA bundle run identity
+    default: ""
+  prod_preflight_service_principal:
+    description: PROD preflight bundle run identity
+    default: ""
+  prod_service_principal:
+    description: PROD bundle run identity
+    default: ""
+
+targets:
+  # DEV/PR preview: ephemeral ci-pr-<id> branch inheriting app_qa_db; deploys source, no artifact.
+  dev-preview:
+    mode: development
+    default: true
+    workspace:
+      host: ${var.workspace_host}
+      root_path: /Shared/.bundle/${bundle.name}/pr-${var.pr_id}
+    variables:
+      environment: dev-preview
+      uc_catalog: app_dev
+      uc_schema: pr_${var.pr_id}
+      lakebase_branch: ci-pr-${var.pr_id}      # ephemeral child of production
+      lakebase_database: app_dev_db
+
+  # QA rehearsal on a disposable child of production (optional; ENABLE_QA_PREFLIGHT).
+  qa-preflight:
+    mode: production
+    workspace:
+      host: ${var.workspace_host}
+      root_path: /Shared/.bundle/${bundle.name}/qa-preflight-${var.commit_sha}
+    variables:
+      environment: qa-preflight
+      uc_catalog: app_qa
+      uc_schema: preflight_${var.commit_sha}
+      lakebase_branch: qa-preflight-${var.commit_sha}
+      lakebase_database: app_qa_db
+    run_as:
+      service_principal_name: ${var.qa_service_principal}
+
+  # QA stable: production branch, app_qa_db database.
+  qa:
+    mode: production
+    workspace:
+      host: ${var.workspace_host}
+      root_path: /Shared/.bundle/${bundle.name}/qa
+    variables:
+      environment: qa
+      uc_catalog: app_qa
+      uc_schema: app
+      lakebase_branch: production      # QA/PROD live on the same long-lived branch; the DATABASE differs
+      lakebase_database: app_qa_db
+    run_as:
+      service_principal_name: ${var.qa_service_principal}
+
+  # PROD rehearsal on a disposable child of production (separate preflight identity).
+  prod-preflight:
+    mode: production
+    workspace:
+      host: ${var.workspace_host}
+      root_path: /Shared/.bundle/${bundle.name}/prod-preflight-${var.commit_sha}
+    variables:
+      environment: prod-preflight
+      uc_catalog: app_prod
+      uc_schema: preflight_${var.commit_sha}
+      lakebase_branch: prod-preflight-${var.commit_sha}
+      lakebase_database: app_prod_db
+    run_as:
+      service_principal_name: ${var.prod_preflight_service_principal}
+
+  # PROD stable: approval-gated, production mode, validated git branch.
+  prod:
+    mode: production
+    workspace:
+      host: ${var.workspace_host}
+      root_path: /Shared/.bundle/${bundle.name}/prod
+    git:
+      branch: main
+    variables:
+      environment: prod
+      uc_catalog: app_prod
+      uc_schema: app
+      lakebase_branch: production
+      lakebase_database: app_prod_db
+    run_as:
+      service_principal_name: ${var.prod_service_principal}
