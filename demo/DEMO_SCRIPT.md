@@ -47,6 +47,11 @@ Click **Run**. The **QA** panel flips to **V004 · present**.
 > "Same migration file, same branch — only the database selector changes to `app_qa_db`. Promotion
 > is a replay across databases, not a branch merge."
 
+> **QA preflight is optional — we don't demo it.** The runbook allows an optional `qa-preflight-<sha>`
+> rehearsal branch (off `production`, selecting `app_qa_db`) for risky migrations, but it's off by
+> default for a small team, so this walkthrough deploys straight to the QA database. Step 7 shows the
+> rehearse-on-a-branch pattern for production, which is the same idea if you ever enable it for QA.
+
 ### Stage 7 — Production preflight
 Click **Run**. A `prod-preflight-demo` branch appears tagged *selects app_prod_db*, the migration is
 rehearsed, then it disappears.
@@ -71,3 +76,24 @@ Point at the panels: all three databases now at V004; the tree back to just `pro
 
 **To run it again:** click **Reset demo** (rewinds V004 on all three databases, deletes the
 ephemeral branches).
+
+---
+
+## Scripts glossary — what's actually running
+
+The **Scripts tab** in the console shows this same glossary plus the full source of each file. Quick
+reference for narrating the demo:
+
+| Script | What it does |
+|---|---|
+| `ci/lakebase.sh` / `ci/lakebase_api.py` | Lakebase control plane — create/delete branches, mint a short-lived DB connection (never logs a credential). |
+| `ci/migrate.sh` / `ci/migrate.py` | The migration runner — applies the ordered `db/migrations/*.sql` to **one** database and records them. The actual promotion: same files replayed into `app_dev_db` → `app_qa_db` → `app_prod_db`. |
+| `ci/check_migrations.sh` | Lints the migration files (names, ordering, destructive-SQL warning) before any database is touched. |
+| `ci/seed.py` | Loads sample rows for validation only — never promoted. |
+| `ci/build.sh` | Packages the app once into a tarball from the Git SHA. |
+| `ci/publish_artifact.sh` / `ci/fetch_artifact.sh` | Record the tarball + its SHA-256, then verify that exact digest before QA/PROD — "same bytes everywhere." |
+| `ci/deploy_preview.sh` | Wraps `databricks bundle` for previews (quiesce / discover URL / destroy). |
+| `ci/uc.sh` | Creates/deletes per-PR Unity Catalog schemas (lakehouse scratch, separate from the Postgres app). |
+| `ci/smoke_test.sh` | Post-deploy check that the target database is reachable with the expected schema. |
+
+Each stage card also prints the exact command and the underlying Lakebase API call it runs.

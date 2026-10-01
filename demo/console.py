@@ -120,7 +120,9 @@ STAGES = [
 
     ("deploy-qa", "6 · Deploy to QA", "",
      "Replay the SAME migration set into production/app_qa_db, then deploy the built artifact. Same "
-     "branch as DEV — only the database selector changes. Promotion is a replay, not a branch copy.",
+     "branch as DEV — only the database selector changes. Promotion is a replay, not a branch copy. "
+     "(A QA preflight branch is OPTIONAL in the runbook — used only for risky migrations — and is "
+     "not part of this walkthrough; step 7's prod preflight shows the rehearsal-on-a-branch pattern.)",
      [("./ci/migrate.sh --branch production --database app_qa_db", _mig(BRANCH, QA_DB)),
       ("databricks bundle deploy --target qa --var=lakebase_branch=production --var=lakebase_database=app_qa_db", None)],
      "replay migrations into production/app_qa_db → bundle deploy --target qa (same artifact)"),
@@ -319,6 +321,29 @@ SCRIPTS = [
 ]
 ALLOWED_SCRIPTS = {rel for _, rel in SCRIPTS}
 
+# Plain-language glossary of the scripts that actually RUN during the walkthrough — shown at the
+# top of the Scripts tab so the audience knows what each command is doing as you click through.
+GLOSSARY = [
+    ("lakebase.sh / lakebase_api.py", "Lakebase control plane. Creates & deletes branches and hands "
+     "out a short-lived DB connection — never prints a credential. Runs in setup, start-change, "
+     "preflight, cleanup, and whenever a stage needs a connection."),
+    ("migrate.sh / migrate.py", "The migration runner. Applies the ordered db/migrations/*.sql to ONE "
+     "database and records what ran (version + checksum + git SHA). This is the actual promotion: the "
+     "same files replayed into app_dev_db → app_qa_db → app_prod_db."),
+    ("check_migrations.sh", "Pre-flight lint of the migration files before any database is touched — "
+     "names, ordering, and a warning on destructive SQL (step 2)."),
+    ("seed.py", "Loads sample rows for validation only (setup). Seed data is never promoted."),
+    ("build.sh", "Packages the app once into a tarball from the Git SHA (step 4)."),
+    ("publish_artifact.sh / fetch_artifact.sh", "Publish records the tarball + its SHA-256; fetch "
+     "downloads it and fails unless the digest matches — the 'same bytes everywhere' guarantee."),
+    ("deploy_preview.sh", "Wraps `databricks bundle` for previews: quiesce, discover the app URL, "
+     "destroy. (Shown in the stage commands; the bundle deploy itself is narrated, not run here.)"),
+    ("uc.sh", "Creates/deletes per-PR Unity Catalog schemas — lakehouse scratch, separate from the "
+     "Postgres app database."),
+    ("smoke_test.sh", "Quick post-deploy check that the target database is reachable with the expected "
+     "schema."),
+]
+
 
 app.layout = html.Div(style={"fontFamily": "system-ui,sans-serif", "background": C["bg"],
                              "color": C["ink"], "minHeight": "100vh", "padding": "20px"}, children=[
@@ -358,8 +383,19 @@ app.layout = html.Div(style={"fontFamily": "system-ui,sans-serif", "background":
                          "borderRadius": "8px", "fontSize": "12px", "height": "220px", "overflowY": "auto", "margin": 0})])])])]),
 
     html.Div(id="tab-scripts", hidden=True, children=[
+      html.Div(style={**PANEL, "marginBottom": "16px"}, children=[
+        html.Div("WHAT RUNS DURING THE DEMO", style={"fontSize": "11px", "letterSpacing": ".08em",
+                 "color": C["mut"], "fontWeight": 700, "marginBottom": "8px"}),
+        *[html.Div(style={"display": "grid", "gridTemplateColumns": "230px 1fr", "gap": "12px",
+                          "padding": "7px 0", "borderBottom": f"1px solid {C['line']}"},
+                   children=[html.Code(name, style={"fontSize": "12.5px", "color": C["accent"],
+                                                    "fontWeight": 600}),
+                             html.Span(desc, style={"fontSize": "13px", "color": C["ink"]})])
+          for name, desc in GLOSSARY],
+        html.Div("Each stage card (Walkthrough tab) also prints the exact command + the underlying "
+                 "Lakebase API call it runs.", style={"color": C["mut"], "fontSize": "12px", "marginTop": "10px"})]),
       html.Div(style=PANEL, children=[
-        html.Div("THE SCRIPTS BEHIND EACH STEP", style={"fontSize": "11px", "letterSpacing": ".08em",
+        html.Div("READ THE FULL SOURCE", style={"fontSize": "11px", "letterSpacing": ".08em",
                  "color": C["mut"], "fontWeight": 700}),
         html.Div("The exact files the stages run — the ci/ scripts, the promoted migration, the bundle, and "
                  "the workflows. Pick one to read it; this is live from disk.",
