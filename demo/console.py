@@ -296,6 +296,30 @@ def stage_card(stage):
                   html.Code(api, style={"fontSize": "12px"})])])
 
 
+# Files viewable in the "Scripts" tab — the exact code each stage runs. (label, repo-relative path)
+SCRIPTS = [
+    ("ci/lakebase.sh — Lakebase control-plane wrapper (branches, databases, connections)", "ci/lakebase.sh"),
+    ("ci/lakebase_api.py — SDK engine behind lakebase.sh (projects/branches/credentials)", "ci/lakebase_api.py"),
+    ("ci/migrate.sh — migration runner (thin wrapper over migrate.py)", "ci/migrate.sh"),
+    ("ci/migrate.py — migration runner engine (advisory lock, checksum, history)", "ci/migrate.py"),
+    ("ci/seed.py — load non-production seed data", "ci/seed.py"),
+    ("ci/check_migrations.sh — static migration-file checks", "ci/check_migrations.sh"),
+    ("ci/build.sh — build the application artifact once from a Git SHA", "ci/build.sh"),
+    ("ci/publish_artifact.sh — publish the artifact + record its SHA-256", "ci/publish_artifact.sh"),
+    ("ci/fetch_artifact.sh — fetch + verify the exact artifact by digest", "ci/fetch_artifact.sh"),
+    ("ci/deploy_preview.sh — preview deploy / discover-url / destroy helpers", "ci/deploy_preview.sh"),
+    ("ci/uc.sh — Unity Catalog preview-schema helpers", "ci/uc.sh"),
+    ("ci/smoke_test.sh — post-deploy smoke check", "ci/smoke_test.sh"),
+    ("db/migrations/V004__add_signup_source.sql — the change this demo promotes", "db/migrations/V004__add_signup_source.sql"),
+    ("db/roles/grants.sql — per-database role grants (the isolation boundary)", "db/roles/grants.sql"),
+    ("databricks.yml — one bundle, five targets", "databricks.yml"),
+    (".github/workflows/pr.yml — PR validation (ci-pr branch on app_dev_db)", ".github/workflows/pr.yml"),
+    (".github/workflows/main-to-qa.yml — build → dev-baseline → QA", ".github/workflows/main-to-qa.yml"),
+    (".github/workflows/promote-prod.yml — preflight → approval → PROD", ".github/workflows/promote-prod.yml"),
+]
+ALLOWED_SCRIPTS = {rel for _, rel in SCRIPTS}
+
+
 app.layout = html.Div(style={"fontFamily": "system-ui,sans-serif", "background": C["bg"],
                              "color": C["ink"], "minHeight": "100vh", "padding": "20px"}, children=[
     dcc.Interval(id="tick", interval=1400, n_intervals=0),
@@ -307,7 +331,12 @@ app.layout = html.Div(style={"fontFamily": "system-ui,sans-serif", "background":
              "replaying migrations dev → qa → prod across the databases · only code, artifacts, and migrations move forward",
              style={"color": C["mut"], "fontSize": "13px", "marginBottom": "16px"}),
 
-    html.Div(style={"display": "grid", "gridTemplateColumns": "1.3fr 1fr", "gap": "16px"}, children=[
+    dcc.Tabs(id="tabs", value="walk", style={"marginBottom": "14px"}, children=[
+        dcc.Tab(label="Walkthrough", value="walk"),
+        dcc.Tab(label="Scripts", value="scripts")]),
+
+    html.Div(id="tab-walk", children=[
+      html.Div(style={"display": "grid", "gridTemplateColumns": "1.3fr 1fr", "gap": "16px"}, children=[
         html.Div(children=[
             html.Div(style={"display": "flex", "gap": "8px", "marginBottom": "12px"}, children=[
                 html.Button("↻ Refresh live state", id="btn-refresh", n_clicks=0,
@@ -326,7 +355,22 @@ app.layout = html.Div(style={"fontFamily": "system-ui,sans-serif", "background":
                 html.Div("ACTIVITY LOG", style={"fontSize": "11px", "letterSpacing": ".08em",
                          "color": C["mut"], "fontWeight": 700, "marginBottom": "6px"}),
                 html.Pre(id="log", style={"background": C["code"], "color": "#cfe3ff", "padding": "12px",
-                         "borderRadius": "8px", "fontSize": "12px", "height": "220px", "overflowY": "auto", "margin": 0})])])])])
+                         "borderRadius": "8px", "fontSize": "12px", "height": "220px", "overflowY": "auto", "margin": 0})])])])]),
+
+    html.Div(id="tab-scripts", hidden=True, children=[
+      html.Div(style=PANEL, children=[
+        html.Div("THE SCRIPTS BEHIND EACH STEP", style={"fontSize": "11px", "letterSpacing": ".08em",
+                 "color": C["mut"], "fontWeight": 700}),
+        html.Div("The exact files the stages run — the ci/ scripts, the promoted migration, the bundle, and "
+                 "the workflows. Pick one to read it; this is live from disk.",
+                 style={"color": C["mut"], "fontSize": "13px", "margin": "4px 0 10px"}),
+        dcc.Dropdown(id="script-pick", clearable=False, value="ci/lakebase.sh",
+                     options=[{"label": lbl, "value": rel} for lbl, rel in SCRIPTS],
+                     style={"maxWidth": "640px", "marginBottom": "10px"}),
+        html.Pre(id="script-body", style={"background": C["code"], "color": "#d7e7ff", "padding": "14px",
+                 "borderRadius": "8px", "fontSize": "12.5px", "lineHeight": "1.5", "overflow": "auto",
+                 "maxHeight": "72vh", "margin": 0})])]),
+])
 
 
 @app.callback(Output({"type": "badge", "sid": dash.ALL}, "children"),
@@ -341,6 +385,23 @@ def render_badges(_):
         glyphs.append(g)
         styles.append({"color": col, "fontWeight": 700, "marginRight": "8px"})
     return glyphs, styles
+
+
+@app.callback(Output("tab-walk", "hidden"), Output("tab-scripts", "hidden"), Input("tabs", "value"))
+def switch_tab(v):
+    # toggle visibility (components stay mounted, so the interval callbacks keep finding them)
+    return v != "walk", v != "scripts"
+
+
+@app.callback(Output("script-body", "children"), Input("script-pick", "value"))
+def show_script(path):
+    if path not in ALLOWED_SCRIPTS:
+        return "(unknown file)"
+    try:
+        with open(os.path.join(REPO, path), encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:  # noqa: BLE001
+        return f"(cannot read {path}: {e})"
 
 
 @app.callback(Output("tree", "children"), Output("envs", "children"), Output("log", "children"),

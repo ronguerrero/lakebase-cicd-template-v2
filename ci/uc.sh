@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # uc.sh — Unity Catalog preview-namespace helpers (runbook section 5).
 #
+# IN PLAIN TERMS: creates/deletes the per-PR and per-preflight Unity Catalog schemas (lakehouse
+# scratch space). These UC objects are separate from the Postgres application database.
+#
 # UC catalogs (app_dev/app_qa/app_prod) hold ordinary lakehouse objects and are PARALLEL to
 # Lakebase, not bound to it. CI owns creation/deletion of per-PR and per-preflight schemas;
 # humans never create objects in the stable app schemas. Uses the Databricks CLI with ambient

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # publish_artifact.sh — publish the immutable artifact and record its digest (runbook sections 7.2, 9).
 #
+# IN PLAIN TERMS: stores the built tarball and records its SHA-256, so later stages can prove they
+# are deploying exactly the same bytes that were built and tested.
+#
 #   ./ci/publish_artifact.sh --sha "$GITHUB_SHA" --output "$GITHUB_OUTPUT"
 #
 # Emits artifact_uri and artifact_sha256 as step outputs; QA/PROD fetch and verify EXACTLY these.

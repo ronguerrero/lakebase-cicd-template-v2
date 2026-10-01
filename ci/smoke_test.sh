@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # smoke_test.sh — minimal post-deploy health check (runbook sections 6-7).
 #
+# IN PLAIN TERMS: a quick check after a deploy that the database the app points at is reachable and
+# carries the expected schema (migration history + users). Extend with an HTTP probe of the app.
+#
 # Confirms the database the app is pointed at is reachable and carries the expected schema.
 # Uses DATABASE_URL (the branch the preview/stable app is bound to). Extend with an HTTP probe
 # of APP_BASE_URL for the deployed app's own health endpoint.

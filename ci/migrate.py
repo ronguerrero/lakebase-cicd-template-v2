@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """PostgreSQL migration runner — the procedural half of the CI/CD.
 
+IN PLAIN TERMS: applies the ordered db/migrations/*.sql files to ONE database and records which
+ones ran (version + checksum + git SHA). This is what moves V004 into app_dev_db, then app_qa_db,
+then app_prod_db — the same files replayed against each database, which is the whole promotion.
+
 Owns Postgres execution ONLY. Branch creation, endpoint discovery, and connection-ref
 provisioning belong to ci/lakebase.sh (ci/lakebase_api.py); bundle deployment belongs to the
 Databricks bundle workflow. Promotion = replaying this ordered migration set against each

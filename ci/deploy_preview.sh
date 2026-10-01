@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # deploy_preview.sh — preview lifecycle helpers around `databricks bundle` (runbook section 7).
 #
+# IN PLAIN TERMS: the operations around a preview deploy — stop a running preview before a reset,
+# discover the deployed app's URL for smoke tests, and tear a preview namespace down afterward.
+#
 # The bundle itself deploys resources; this wrapper handles the operations around it: quiesce a
 # running preview before a branch reset, discover the deployed app URL, and destroy a preview
 # namespace on cleanup. Each PR/preflight gets an isolated bundle root + resource names so

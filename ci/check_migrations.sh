@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # check_migrations.sh — static validation of the migration directory (runbook section 6, step 3).
 #
+# IN PLAIN TERMS: checks the migration files BEFORE any database is touched — names match
+# V<NNN>__<desc>.sql, version numbers strictly increase, and destructive SQL is flagged for review.
+#
 # These are offline checks that run before touching any database:
 #   * file names match V<NNN>__<description>.sql
 #   * version numbers are unique and strictly increasing

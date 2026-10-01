@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # fetch_artifact.sh — retrieve and verify the exact published artifact (runbook sections 7.2, 9).
 #
+# IN PLAIN TERMS: downloads the stored tarball and FAILS if its SHA-256 does not match — this is the
+# "deploy the same bytes everywhere" guarantee enforced before QA and PROD deploys.
+#
 #   ./ci/fetch_artifact.sh --uri "$ARTIFACT_URI" --sha256 "$ARTIFACT_SHA256"
 #
 # Fails if the digest does not match: QA and PROD must deploy the identical bytes that were built

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Apply non-production seed data to a branch (runbook: seeds are validation-only, never promoted).
 
+IN PLAIN TERMS: loads sample rows (db/seeds/*.sql) into a database so the demo has data to show.
+Seed data is for validation only and is never promoted between environments.
+
 Runs every db/seeds/*.sql in order against the selected database. Connects via DATABASE_URL or,
 for local/console use, via --profile/--project/--branch/--database (SDK credential).
 """

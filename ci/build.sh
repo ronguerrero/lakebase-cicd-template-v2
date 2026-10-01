@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # build.sh — build the application artifact exactly once from a Git SHA (runbook sections 7.2, 9).
 #
+# IN PLAIN TERMS: packages the app into one tarball from a Git SHA so every environment deploys the
+# identical bytes (verified later by digest) instead of each stage rebuilding from source.
+#
 # "Build once" is the rule: QA and PROD deploy the SAME bytes, verified by digest, rather than
 # re-checking-out the SHA and rebuilding. This produces a deterministic tarball of app/ under dist/.
 set -euo pipefail

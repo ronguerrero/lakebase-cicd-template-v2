@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # lakebase.sh — Lakebase control-plane wrapper (runbook sections 5, 6, 7).
 #
+# IN PLAIN TERMS: creates/destroys Lakebase branches and hands out a database connection URL for a
+# chosen branch+database. Every stage that touches a branch or database goes through here. It never
+# prints a credential to a normal log. All real work is delegated to ci/lakebase_api.py.
+#
 # Centralizes CLI/SDK version differences, readiness polling, connection discovery, retries,
 # reset, and cleanup so workflow files stay declarative. All real work is done by
 # ci/lakebase_api.py (databricks-sdk, projects/branches model). Authentication is ambient:

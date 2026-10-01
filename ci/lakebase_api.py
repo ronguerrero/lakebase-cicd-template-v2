@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Lakebase control-plane engine — the single place that knows how to talk to Lakebase.
 
+IN PLAIN TERMS: the Python that actually calls the Databricks SDK to create the project, the
+long-lived `production` branch, the three databases, ephemeral child branches, and short-lived
+database credentials. ci/lakebase.sh is a thin shell over this module.
+
 `ci/lakebase.sh` shells into this; the guided console imports it. Centralizing the API here
 is deliberate (see the runbook, section 7.1): CLI-version differences, readiness polling,
 connection discovery, retries, reset, and cleanup live in one tested module instead of being

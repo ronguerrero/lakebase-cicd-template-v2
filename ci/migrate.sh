@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # migrate.sh — PostgreSQL migration runner (runbook sections 7 and 10).
 #
+# IN PLAIN TERMS: a thin, stable wrapper so CI, local shells, and the console all invoke the
+# migration runner the same way. It just forwards to ci/migrate.py.
+#
 # Thin, stable CLI surface over ci/migrate.py so CI, local shells, and the guided console all
 # call migrations the same way. Owns Postgres execution ONLY; branch/endpoint/connection-ref
 # work belongs to ci/lakebase.sh.
