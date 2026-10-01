@@ -154,9 +154,28 @@ STAGES = [
 ]
 STAGE_IDS = [s[0] for s in STAGES]
 
+# What each stage acts on — drives the per-card "acts on" line and the live topology diagram.
+# keys reference diagram cells: dev/qa/prod = the three databases on production; devchild = the
+# ephemeral dev/PR child; preflight = the ephemeral prod-preflight child.
+ACTS = {
+    "setup":          {"keys": {"dev", "qa", "prod"}, "verb": "create branch + 3 databases, seed V003",
+                       "text": "production · app_dev_db + app_qa_db + app_prod_db"},
+    "feature":        {"keys": {"devchild"}, "verb": "create child off production",
+                       "text": "dev-* child of production · app_dev_db"},
+    "migrate-branch": {"keys": {"devchild"}, "verb": "apply V004", "text": "dev-* child · app_dev_db"},
+    "test-branch":    {"keys": {"devchild"}, "verb": "validate", "text": "dev-* child · app_dev_db"},
+    "build":          {"keys": set(), "verb": "build artifact (no database)", "text": "— no branch / database —"},
+    "dev-baseline":   {"keys": {"dev"}, "verb": "replay V004", "text": "production · app_dev_db"},
+    "deploy-qa":      {"keys": {"qa"}, "verb": "replay V004", "text": "production · app_qa_db"},
+    "prod-preflight": {"keys": {"preflight"}, "verb": "rehearse V004, then delete",
+                       "text": "prod-preflight-* child · app_prod_db"},
+    "deploy-prod":    {"keys": {"prod"}, "verb": "replay V004 (approved)", "text": "production · app_prod_db"},
+    "cleanup":        {"keys": {"devchild"}, "verb": "delete child", "text": "dev-* child (deleted)", "danger": True},
+}
+
 LOCK = threading.Lock()
 STATE = {"status": {sid: "pending" for sid in STAGE_IDS}, "log": [], "busy": False,
-         "tree": [], "env": {}}
+         "tree": [], "env": {}, "active": None}
 
 
 def log(line):
@@ -171,6 +190,7 @@ def run_stage(sid):
             return
         STATE["busy"] = True
         STATE["status"][sid] = "running"
+        STATE["active"] = sid
     stage = next(s for s in STAGES if s[0] == sid)
     log(f"\n━━━ {stage[1]} ━━━")
     ok = True
@@ -290,6 +310,10 @@ def stage_card(stage):
             html.Button("Run", id={"type": "run", "sid": sid}, n_clicks=0,
                         style={"padding": "6px 16px", "borderRadius": "7px", "border": "none",
                                "background": C["accent"], "color": "#fff", "cursor": "pointer", "fontWeight": 600})]),
+        html.Div([html.Span("ACTS ON  ", style={"fontSize": "10px", "letterSpacing": ".06em",
+                  "color": C["mut"], "fontWeight": 700}),
+                  html.Code(ACTS.get(sid, {}).get("text", "—"),
+                            style={"fontSize": "12px", "color": C["accent"]})], style={"marginTop": "4px"}),
         html.Div(blurb, style={"color": C["mut"], "fontSize": "13px", "marginTop": "6px"}),
         html.Pre("\n".join("$ " + d for d, _ in cmds),
                  style={"background": C["code"], "color": "#d7e7ff", "padding": "10px", "borderRadius": "6px",
@@ -361,6 +385,7 @@ app.layout = html.Div(style={"fontFamily": "system-ui,sans-serif", "background":
         dcc.Tab(label="Scripts", value="scripts")]),
 
     html.Div(id="tab-walk", children=[
+      html.Div(id="diagram", style={**PANEL, "marginBottom": "16px"}),
       html.Div(style={"display": "grid", "gridTemplateColumns": "1.3fr 1fr", "gap": "16px"}, children=[
         html.Div(children=[
             html.Div(style={"display": "flex", "gap": "8px", "marginBottom": "12px"}, children=[
@@ -421,6 +446,62 @@ def render_badges(_):
         glyphs.append(g)
         styles.append({"color": col, "fontWeight": 700, "marginRight": "8px"})
     return glyphs, styles
+
+
+def diagram_children(active, status):
+    """Topology diagram that highlights the branch + database the active stage acts on."""
+    act = ACTS.get(active or "", {})
+    hl = act.get("keys", set())
+    danger = act.get("danger", False)
+    hc = C["err"] if danger else C["run"] if status == "running" else C["ok"] if status == "done" else C["accent"]
+    tint = {C["accent"]: C["accent2"], C["ok"]: "#e8f6ee", C["run"]: "#fdf1df", C["err"]: "#fbe9e9"}
+
+    def cell(key, label, sub):
+        on = key in hl
+        return html.Div(style={"flex": "1", "minWidth": "110px", "padding": "9px 10px", "borderRadius": "8px",
+                               "textAlign": "center", "border": f"2px solid {hc if on else C['line']}",
+                               "background": tint[hc] if on else C["card"]},
+                        children=[html.Div(label, style={"fontWeight": 700, "fontSize": "13px",
+                                           "color": hc if on else C["ink"]}),
+                                  html.Div(sub, style={"fontSize": "11px", "color": C["mut"], "marginTop": "2px"}),
+                                  html.Div("◀ acting now", style={"fontSize": "10px", "fontWeight": 700,
+                                           "color": hc, "marginTop": "3px"}) if on else html.Div()])
+
+    prod_on = bool(hl & {"dev", "qa", "prod"})
+    production = html.Div(style={"border": f"2px solid {hc if prod_on else C['line']}", "borderRadius": "10px",
+                                 "padding": "10px", "background": tint[hc] + "55" if prod_on else C["bg"]}, children=[
+        html.Div("production — the one long-lived branch", style={"fontWeight": 700, "fontSize": "12px",
+                 "color": hc if prod_on else C["ink"], "marginBottom": "8px"}),
+        html.Div(style={"display": "flex", "gap": "10px"}, children=[
+            cell("dev", "app_dev_db", "DEV baseline"),
+            cell("qa", "app_qa_db", "QA"),
+            cell("prod", "app_prod_db", "PROD")])])
+
+    ephemeral = html.Div(style={"marginTop": "10px"}, children=[
+        html.Div("ephemeral children of production (created on demand, never promoted)",
+                 style={"fontSize": "11px", "color": C["mut"], "marginBottom": "6px"}),
+        html.Div(style={"display": "flex", "gap": "10px"}, children=[
+            cell("devchild", "dev-* / ci-pr-*", "selects app_dev_db"),
+            cell("preflight", "prod-preflight-*", "selects app_prod_db")])])
+
+    if active:
+        cap = f"Now acting on:  {act.get('text','—')}   —   {act.get('verb','')}  ({status})"
+        capcol = hc
+    else:
+        cap = "Run a stage to see which branch and database it acts on."
+        capcol = C["mut"]
+    return [html.Div("WHERE THIS STAGE ACTS", style={"fontSize": "11px", "letterSpacing": ".08em",
+                     "color": C["mut"], "fontWeight": 700, "marginBottom": "8px"}),
+            production, ephemeral,
+            html.Div(cap, style={"marginTop": "10px", "fontSize": "13px", "fontWeight": 600, "color": capcol})]
+
+
+@app.callback(Output("diagram", "children"), Input("tick", "n_intervals"))
+def render_diagram(_):
+    with LOCK:
+        active = STATE.get("active")
+        status = STATE["status"].get(active) if active else None
+    return diagram_children(active, status)
 
 
 @app.callback(Output("tab-walk", "hidden"), Output("tab-scripts", "hidden"), Input("tabs", "value"))
