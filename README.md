@@ -151,14 +151,55 @@ are revoked from `PUBLIC` and granted only to that database's roles. See
 
 ---
 
+## Bring your own CI
+
+The portable contract is the **`ci/` scripts** — they are CI-system-agnostic. The
+`.github/workflows/` files are **one example orchestration**; GitHub Actions is not required.
+Azure DevOps, GitLab CI, Jenkins, or any runner work the same way: authenticate to the workspace
+(workload-identity/OIDC where possible), then make these calls in order. Nothing above the `ci/`
+layer is Databricks- or GitHub-specific.
+
+```
+# On a pull request (DEV/PR validation)
+./ci/lakebase.sh prepare-ci-branch  <project> ci-pr-<n> --source-branch production --database app_dev_db --reset-existing
+eval "$(./ci/lakebase.sh wait-and-export <project> ci-pr-<n> app_dev_db)"   # -> DATABASE_URL (env, never logged)
+./ci/check_migrations.sh db/migrations
+DATABASE_URL=$LAKEBASE_DATABASE_URL ./ci/migrate.sh --directory db/migrations
+#   run tests + cross-database denial check; on PR close: ./ci/lakebase.sh delete-ci-branch ...
+
+# On merge to main (build once, then promote by replaying into each database on production)
+./ci/build.sh "$SHA" && ./ci/publish_artifact.sh --sha "$SHA" --output "$OUT"   # artifact + sha256
+for db in app_dev_db app_qa_db; do          # DEV baseline, then QA
+  eval "$(./ci/lakebase.sh export-stable-connection <project> production $db)"
+  DATABASE_URL=$LAKEBASE_STABLE_DATABASE_URL ./ci/migrate.sh --directory db/migrations
+  databricks bundle deploy --target <env> --var=lakebase_branch=production --var=lakebase_database=$db ...
+done
+
+# Production (gate this on your platform's approval mechanism)
+./ci/lakebase.sh create-preflight prod-preflight-$SHA <project> --source-branch production   # rehearse app_prod_db, then delete
+eval "$(./ci/lakebase.sh export-stable-connection <project> production app_prod_db)"
+DATABASE_URL=$LAKEBASE_STABLE_DATABASE_URL ./ci/migrate.sh --directory db/migrations
+databricks bundle deploy --target prod --var=lakebase_branch=production --var=lakebase_database=app_prod_db ...
+```
+
+Three things your CI platform supplies, not this repo: an **approval gate** before the production
+step, **per-environment identities** (OIDC → service principals), and **secret/variable storage**.
+Those are environment-specific and governed by your org — set them up once in your CI of choice.
+The guided console (above) demonstrates this exact sequence live without any CI wiring, which is
+why it, not a pipeline, is the recommended way to *show* the model.
+
+---
+
 ## Make it your own
 
 1. Replace the sample app in `app/` and the migrations in `db/migrations/` with yours.
 2. Set `workspace_host` and the `*_service_principal` variables in `databricks.yml` (or via
    `BUNDLE_VAR_*`); point `LAKEBASE_PROJECT` at your project.
-3. Configure GitHub OIDC → per-environment service principals and the `dev`/`qa`/`prod-preflight`/
-   `prod` GitHub environments with a required approval on `prod`. Pin every action to an approved
-   commit (the workflows ship with `<approved-pinned-commit>` placeholders on purpose).
+3. Wire up your CI (see **Bring your own CI** above): per-environment identities (OIDC → service
+   principals), secret/variable storage, and a required approval gate before the production step.
+   If you use the example GitHub Actions workflows, create the `dev`/`qa`/`prod-preflight`/`prod`
+   environments with a required approval on `prod`, and pin every action to an approved commit (the
+   workflows ship with `<approved-pinned-commit>` placeholders on purpose).
 4. Apply the per-database role bootstrap in `db/roles/` with a privileged identity.
 5. Validate before handoff:
    ```bash
